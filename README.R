@@ -8,7 +8,7 @@ Copyrights: Crown Copyright
 
 In this project, we conduct a population-level analysis of the characteristics of women receiving an endometriosis diagnosis in an NHS hospital in England between 2011 and 2021. 
 
-Link to ONS release: https://www.ons.gov.uk/releases/characteristicsofwomenwithanendometriosisdiagnosisinengland27march2011to31december2021
+Link to the ONS release: https://www.ons.gov.uk/releases/characteristicsofwomenwithanendometriosisdiagnosisinengland27march2011to31december2021
 
 Project completed for: Labour Markets Evaluation and Pilots Fund (2024 to 2025) https://www.gov.uk/government/publications/new-labour-markets-evaluation-and-pilots-fund
 
