@@ -1,0 +1,1940 @@
+####################################################################################################################################
+# Dataset preparation
+####################################################################################################################################
+
+source(".../00_session_setup.R")
+
+#--------------------------
+# user options
+#--------------------------
+
+run_sample_flow <- FALSE
+run_checks <- FALSE
+save_dataset <- FALSE
+
+#--------------------------
+# read in lookups
+#--------------------------
+
+# IMD
+imd_path <- "..."
+
+df_imd <- spark_read_csv(
+  sc, 
+  name = "IMD", 
+  path = imd_path, 
+  header = TRUE, 
+  delimiter = ",") %>%
+  rename_with(tolower) %>%
+  select(lsoa11cd, imd_rank, imd_quintile, imd_decile)
+
+# NSPL
+df_nspl <- sdf_sql(sc, "SELECT * FROM ...")
+
+# LA names lookup
+df_la_names <- spark_read_csv(
+  sc, 
+  name = "df_la_names", 
+  path = "...", 
+  header = TRUE, 
+  delimiter = ",") %>%
+  select(ltla22cd, utla22cd, utla = utla22nm) %>%
+  sdf_distinct()
+
+# Join NSPL to LA names
+df_utla_lookup <- left_join(df_nspl, df_la_names, by = c("laua" = "ltla22cd")) %>%
+  select(lsoa11, utla22cd, utla) %>%
+  sdf_distinct() %>%
+  mutate(utla = case_when(utla %in% c("Cornwall", "Isles of Scilly") ~ "Cornwall and Isles of Scilly",
+                          utla %in% c("City of London", "Hackney") ~ "City of London and Hackney",
+                          TRUE ~ utla))
+
+# local authority district codes and names
+# combine small local authorities with a neighbouring local authority
+lad_names_path <- "..."
+
+df_lad_names <- spark_read_csv(
+  sc, 
+  name = "lad_names", 
+  path = lad_names_path, 
+  header = TRUE, 
+  delimiter = ",") %>%
+  rename_with(tolower) %>%
+  select(lad11cd, lad12cd, lad13cd, lad14cd, lad15cd, lad16cd,
+         lad17cd, lad18cd, lad19cd, lad20cd, lad21cd, lad21nm) %>%
+  pivot_longer(-lad21nm, 
+               names_to = "geography",
+               values_to = "ladcd") %>%
+  arrange(lad21nm) %>%
+  distinct() %>%
+  collect() %>%
+  group_by(lad21nm) %>%
+  mutate(lad21cd = ladcd[lad21nm == lad21nm & geography == "lad21cd"]) %>%
+  ungroup() %>%
+  select(-geography) %>%
+  distinct() %>%
+  mutate(ladst_hes = case_when(lad21nm %in% c("Cornwall", "Isles of Scilly") ~ "Cornwall and Isles of Scilly",
+                               lad21nm %in% c("City of London", "Hackney") ~ "City of London and Hackney",
+                               TRUE ~ lad21nm)) %>%
+  arrange(ladst_hes)
+
+#--------------------------
+# read in upper tier local authority code and name lookup
+# combine small local authorities with a neighbouring local authority
+#--------------------------
+
+# ltla21 to utla21 lookup
+ltla_utla_lookup <- read_xlsx(paste0("..."))
+
+# join lad to utla
+df_utla_names <- left_join(df_lad_names, ltla_utla_lookup, by = c("lad21cd" = "LTLA21CD")) %>%
+  mutate(utla_hes = case_when(UTLA21NM %in% c("Cornwall", "Isles of Scilly") ~ "Cornwall and Isles of Scilly",
+                              UTLA21NM %in% c("City of London", "Hackney") ~ "City of London and Hackney",
+                              TRUE ~ UTLA21NM)) %>%
+  select(ladcd, ladst_hes, utla_hes) %>%
+  distinct()
+
+# save in spark for joining to the main dataset later
+df_utla_names_sdf <- copy_to(sc, df_utla_names, "df_lad_names_sdf", overwrite = TRUE)
+
+
+#--------------------------
+# read in ICD 10 lookup
+#--------------------------
+
+icd10_lookup <- read.csv("...") %>%
+  rename_with(tolower) %>%
+  select(code_x2, code_x3, code_x4, sub_chapter, block, lc_group_description_bk)
+
+icd10_lookup_sdf <- copy_to(sc, icd10_lookup, "icd10_lookup_sdf", overwrite = TRUE)
+
+
+####################################################################################################################################
+# HES (primary and secondary diagnoses - main analysis)
+####################################################################################################################################
+
+#--------------------------
+# read in HES data
+# from v3 pipeline (episode level data)
+#--------------------------
+
+df_hes <- sdf_sql(sc,paste0("SELECT * FROM ", hes_dataset))
+
+
+#--------------------------
+# select required columns
+#--------------------------
+
+df_hes <- df_hes %>%
+  select(NEWNHSNO, SEX, start_date, end_date, ELECDUR, ADMIAGE, RESGOR_ONS, 
+         RESLADST, ADMIMETH, DIAG_01, DIAG_4_01, contains("Endometriosis")) %>%
+  mutate(in_hes = 1)
+
+
+#--------------------------
+# convert start_date to date format
+# input in dttm format, will cause issues if not converted
+#--------------------------
+
+df_hes <- df_hes %>% 
+  mutate(start_date = to_date(start_date, "yyyy-MM-dd")) %>%
+  mutate(end_date = to_date(end_date, "yyyy-MM-dd"))
+
+
+#--------------------------
+# create endo flag (diag_endo) in data - any type
+#--------------------------
+df_hes <- df_hes %>% 
+  mutate(diag_endo = case_when(Endometriosis_flag == "Ever" |
+                               Endometriosis_uterus_flag == "Ever" |
+                               Endometriosis_ovary_flag == "Ever" |
+                               Endometriosis_fallopiantube_flag == "Ever" |
+                               Endometriosis_pelvicperitoneum_flag == "Ever" |
+                               Endometriosis_rectovaginalseptumandvagina_flag == "Ever" |
+                               Endometriosis_intestine_flag == "Ever" |
+                               Endometriosis_cutaneousscar_flag == "Ever" |
+                               Other_endometriosis_flag == "Ever" |
+                               Endometriosis_unspecified_flag == "Ever" ~ 1 , 
+                               TRUE ~ 0))
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  hes_all_episodes <- df_hes %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  hes_all_episodes_endo <- df_hes %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- data.frame(sample = character(), 
+                            n = numeric(0),
+                            endo = numeric(0),
+                            endo_primary = numeric(0))
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "hes_all_episodes", 
+                         n = hes_all_episodes,
+                         endo = hes_all_episodes_endo,
+                         endo_primary = NULL)
+  
+  print(sample_flow)
+  
+}
+
+#--------------------------
+# create year and month of diagnosis variables in HES
+#--------------------------
+
+# create 'year_date' variable
+df_hes <- df_hes %>% 
+  mutate(year = substr(start_date, 1, 4))
+
+# check
+if (run_checks == TRUE) {  
+  df_hes %>% group_by(year) %>% tally() %>% arrange(year) %>% collect() %>% print()
+}
+
+#create 'year_month' variable
+df_hes <- df_hes %>% 
+  mutate(year_month = substr(start_date, 1, 7))
+
+# check
+if (run_checks == TRUE) {  
+  df_hes %>% group_by(year_month) %>% tally() %>% arrange(year_month) %>% collect() %>% print()
+}
+
+#--------------------------
+# create financial year variable to check our estimates against NHS Digital HES estimates
+#--------------------------
+
+df_hes <- df_hes %>%
+	mutate(financial_year = case_when(
+                               start_date >= '2009-01-01' & start_date <= '2009-04-05' ~ "08/09",
+                               start_date >= '2009-04-06' & start_date <= '2010-04-05' ~ "09/10",
+                               start_date >= '2010-04-06' & start_date <= '2011-04-05' ~ "10/11",
+                               start_date >= '2011-04-06' & start_date <= '2012-04-05' ~ "11/12",
+                               start_date >= '2012-04-06' & start_date <= '2013-04-05' ~ "12/13",
+                               start_date >= '2013-04-06' & start_date <= '2014-04-05' ~ "13/14",  
+                               start_date >= '2014-04-06' & start_date <= '2015-04-05' ~ "14/15", 
+                               start_date >= '2015-04-06' & start_date <= '2016-04-05' ~ "15/16",
+                               start_date >= '2016-04-06' & start_date <= '2017-04-05' ~ "16/17",
+                               start_date >= '2017-04-06' & start_date <= '2018-04-05' ~ "17/18",
+                               start_date >= '2018-04-06' & start_date <= '2019-04-05' ~ "18/19",
+                               start_date >= '2019-04-06' & start_date <= '2020-04-05' ~ "19/20",
+                               start_date >= '2020-04-06' & start_date <= '2021-04-05' ~ "20/21",
+                               start_date >= '2021-04-06' & start_date <= '2022-04-05' ~ "21/22",
+                               start_date >= '2022-04-06' & start_date <= '2023-04-05' ~ "22/23",
+                               start_date >= '2023-04-06' & start_date <= '2023-12-31' ~ "23/24",
+                               TRUE ~ "No value"))
+
+# check
+if (run_checks == TRUE) {  
+  
+  # count of first endo diagnoses by month
+  df_first_endo_diag_by_month_all_episodes <- df_hes %>%
+    select(start_date, year_month, NEWNHSNO, diag_endo) %>%
+    filter(!is.na(start_date) & 
+           start_date >= study_start_date) %>%
+    filter(diag_endo == 1) %>%  
+    group_by(NEWNHSNO) %>%
+    filter(start_date == min(start_date)) %>%
+    ungroup() %>%
+    distinct() %>%
+    group_by(year_month) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    arrange(year_month) %>%
+    collect()
+
+  print(df_first_endo_diag_by_month_all_episodes)
+
+  write.csv(df_first_endo_diag_by_month_all_episodes, 
+            paste0(out_path, "num_first_endo_diag_by_month_main.csv"),
+            row.names = FALSE)
+  
+  df_first_endo_diag_by_month_2011_2022 <- df_first_endo_diag_by_month_all_episodes %>%
+    filter(year_month >= "2011-04" & year_month <= "2023-06")
+    
+  print(df_first_endo_diag_by_month_2011_2022)
+
+  write.csv(df_first_endo_diag_by_month_2011_2022, 
+            paste0(out_path, "num_first_endo_diag_by_month_2011_2023_main.csv"),
+            row.names = FALSE)
+
+  # plot count of first endo diagnoses by month
+  ggplot(data = df_first_endo_diag_by_month_2011_2022, 
+         aes(x = year_month, 
+             y = n,
+             group = 1)) +
+    geom_point(col = "#206095", size = 1) +
+    geom_line(col = "#206095") +
+    labs(title = "Count of first endometriosis diagnoses by month, Jan 2011 to Jun 2023",
+         x = "Month",
+         y = "") +
+    scale_y_continuous(limits = c(0, NA), labels = scales::comma) +
+    scale_x_discrete(breaks = c("2012-01", "2013-01", 
+                                "2014-01", "2015-01", "2016-01",
+                                "2017-01", "2018-01", "2019-01",
+                                "2020-01", "2021-01", "2022-01",
+                                "2023-01")) +
+    theme_bw()
+
+  ggsave(paste0(out_path_plots, "plot_num_first_endo_diag_by_month_2011_2023_main.pdf"),
+         width = 10, height = 4, units = "in")
+  
+  
+}
+
+#--------------------------
+# for each NHS number, count number of episodes pre-study start date
+# join these back onto the dataset later after linking onto census
+# filter out any episodes with endo as a diagnosis
+#--------------------------
+
+#filter to episodes starting before the study start date
+df_hes_pre_study <- df_hes %>%
+  filter(diag_endo == 0) %>%
+  select(NEWNHSNO, start_date) %>%
+  filter(!is.na(start_date)) %>%
+  filter(start_date >= "2009-04-01") %>%
+  filter(start_date < study_start_date)
+
+#for each NHS number, only keep unique episode start dates to prevent overcounting
+df_hes_pre_study2 <- df_hes_pre_study %>%
+  distinct()
+
+#count episodes by NHS number
+df_hes_pre_study3 <- df_hes_pre_study2 %>%
+  group_by(NEWNHSNO) %>%
+  count() %>%
+  rename(num_epi_pre_study = n) %>%
+  ungroup()
+
+#--------------------------
+# for each NHS number, check for a diagnosis of endometriosis before the study start date
+# join these back onto the dataset later after linking onto census
+# these individuals need to be filtered out later since we need to assume the study population do not have endometriosis at the start of the study
+#--------------------------
+
+#filter to diagnoses of endometriosis before the study start date
+df_hes_diag_endo_pre_study <- df_hes %>%
+  filter(diag_endo == 1) %>%
+  select(NEWNHSNO, start_date) %>%
+  filter(!is.na(start_date)) %>%
+  filter(start_date < study_start_date)
+
+#deduplicate NHS numbers
+df_hes_diag_endo_pre_study2 <- distinct(df_hes_diag_endo_pre_study, NEWNHSNO) 
+
+#add flag for pre-study diagnosis of endometriosis
+df_hes_diag_endo_pre_study3 <- mutate(df_hes_diag_endo_pre_study2, diag_endo_pre_study = 1)
+
+
+#--------------------------
+# filter episodes to those starting and ending during the study period
+#--------------------------
+
+df_hes_study_period <- filter(df_hes, 
+                              !is.na(start_date) & 
+                              !is.na(end_date) &
+                              start_date >= study_start_date & 
+                              start_date <= study_end_date &
+                              end_date <= study_end_date &
+                              # remove system defaults for missing and invalid end dates
+                              end_date > "1801-01-01")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  hes_episodes_during_study_period <- df_hes_study_period %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  hes_episodes_during_study_period_endo <- df_hes_study_period %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "hes_episodes_during_study_period", 
+                         n = hes_episodes_during_study_period,
+                         endo = hes_episodes_during_study_period_endo,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+# check
+if (run_checks == TRUE) {  
+  df_hes_study_period %>% summarise(min(start_date), max(start_date))
+  df_hes_study_period %>% summarise(min(end_date), max(end_date))  
+  df_hes_study_period %>% select(start_date, end_date) %>% filter(end_date == "2011-03-02")
+}
+
+
+#--------------------------
+# count endo diagnoses during study period
+#--------------------------
+
+# de-duplicate any endo diagnoses on the same day
+df_hes_endo_count <- df_hes_study_period %>% 
+  select(NEWNHSNO, start_date, diag_endo) %>%
+  distinct()
+
+# count endo diagnoses by NHS number
+df_hes_endo_count2 <- df_hes_endo_count %>% 
+  group_by(NEWNHSNO) %>%
+  mutate(diag_endo_count = sum(diag_endo)) %>%
+  ungroup() %>%
+  select(NEWNHSNO, diag_endo_count)
+
+# join back onto full dataset
+df_hes_endo_count3 <- left_join(df_hes_study_period, df_hes_endo_count2, by = "NEWNHSNO")
+
+
+#--------------------------
+# for anyone with an endo diagnosis, filter to episodes with endo diagnoses only 
+# restrict to first date of event
+# group by NHS_no and then use first event
+# start_date is a pre-existing variable from HES that refers to record level timestamp
+#--------------------------
+
+df_hes_first_event <- df_hes_endo_count3 %>% 
+  group_by(NEWNHSNO) %>%
+  filter(diag_endo == max(diag_endo)) %>%
+  ungroup() %>%
+  group_by(NEWNHSNO) %>%
+  filter(start_date == min(start_date)) %>%
+  ungroup()
+
+
+#--------------------------
+# de-duplicate those with multiple flags on same day
+# as this is episodic data there may be multiple entries per day
+#--------------------------
+
+# only keep distinct NHS numbers
+df_hes_dist <- df_hes_first_event %>% 
+  distinct(NEWNHSNO, .keep_all = T)
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  hes_distinct_nhs_numbers <- df_hes_dist %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  hes_distinct_nhs_numbers_endo <- df_hes_dist %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "hes_distinct_nhs_numbers_during_study_period", 
+                         n = hes_distinct_nhs_numbers,
+                            endo = hes_distinct_nhs_numbers_endo,
+                            endo_primary = NULL)
+  print(sample_flow)
+
+}
+
+
+#--------------------------
+# 10 most common primary diagnoses for endo diagnoses
+#--------------------------
+
+if (run_checks == TRUE) {  
+  
+  icd10_lookup_sdf_filtered <- icd10_lookup_sdf %>%
+    select(code_x3, block) %>%
+    distinct()
+  
+  df_top_10_primary <- df_hes_dist %>% 
+    mutate(DIAG_01 = substr(DIAG_01, 1, 3)) %>%
+    mutate(DIAG_4_01 = substr(DIAG_4_01, 1, 3)) %>%
+    mutate(diag_primary = DIAG_01) %>%
+    mutate(diag_primary = ifelse(is.na(diag_primary), DIAG_4_01, diag_primary)) %>%  
+    left_join(icd10_lookup_sdf_filtered, by = c("diag_primary" = "code_x3")) %>%
+    mutate(block = paste(diag_primary, block))
+    
+  df_top_10_primary_count <- df_top_10_primary %>%
+    filter(diag_endo == 1) %>%
+    group_by(block) %>%
+    tally() %>%
+    ungroup() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    mutate(percentage = n / sum(n) * 100) %>%
+    arrange(desc(n)) %>%
+    collect()
+  
+  df_top_10_primary_count %>% data.frame()
+
+  write.csv(df_top_10_primary_count, 
+            paste0(out_path, "top_10_primary_diag_main.csv"),
+            row.names = FALSE)
+
+}
+
+
+####################################################################################################################################
+# HES (primary diagnoses only - supplementary analysis)
+####################################################################################################################################
+
+#--------------------------
+# read in HES data
+# from v3 pipeline (episode level data)
+#--------------------------
+
+df_hes_primary <- sdf_sql(sc,paste0("SELECT * FROM ", hes_dataset_primary_diag_only)) %>%
+  select(NEWNHSNO, SEX, start_date, end_date, ELECDUR, ADMIAGE, RESGOR_ONS, 
+         RESLADST, DIAG_01, DIAG_4_01, contains("Endometriosis")) %>%
+  mutate(in_hes = 1)
+
+
+#--------------------------
+# convert start_date to date format
+# input in dttm format, will cause issues if not converted
+#--------------------------
+
+df_hes_primary <- df_hes_primary %>% 
+  mutate(start_date = to_date(start_date, "yyyy-MM-dd")) %>%
+  mutate(end_date = to_date(end_date, "yyyy-MM-dd"))
+
+
+#--------------------------
+# create endo flag (diag_endo) in data - any type
+#--------------------------
+df_hes_primary <- df_hes_primary %>% 
+  mutate(diag_endo = case_when(Endometriosis_flag == "Ever" |
+                               Endometriosis_uterus_flag == "Ever" |
+                               Endometriosis_ovary_flag == "Ever" |
+                               Endometriosis_fallopiantube_flag == "Ever" |
+                               Endometriosis_pelvicperitoneum_flag == "Ever" |
+                               Endometriosis_rectovaginalseptumandvagina_flag == "Ever" |
+                               Endometriosis_intestine_flag == "Ever" |
+                               Endometriosis_cutaneousscar_flag == "Ever" |
+                               Other_endometriosis_flag == "Ever" |
+                               Endometriosis_unspecified_flag == "Ever" ~ 1 , 
+                               TRUE ~ 0))
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  hes_all_episodes_primary <- df_hes_primary %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  hes_all_episodes_endo_primary <- df_hes_primary %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  sample_flow <- sample_flow %>%
+    mutate(endo_primary = ifelse(sample == "hes_all_episodes",
+                                 hes_all_episodes_endo_primary,
+                                 endo_primary))
+  
+  print(sample_flow)
+  
+}
+
+
+#--------------------------
+# create year and month of diagnosis variables in HES
+#--------------------------
+
+#create 'year_date' variable
+df_hes_primary <- df_hes_primary %>% 
+  mutate(year = substr(start_date, 1, 4))
+
+# check
+if (run_checks == TRUE) {  
+  df_hes_primary %>% group_by(year) %>% tally() %>% arrange(year) %>% collect() %>% print()
+}
+
+#create 'year_month' variable
+df_hes_primary <- df_hes_primary %>% 
+  mutate(year_month = substr(start_date, 1, 7))
+
+# check
+if (run_checks == TRUE) {  
+  df_hes_primary %>% group_by(year_month) %>% tally() %>% arrange(year_month) %>% collect() %>% print()
+}
+
+#--------------------------
+# create financial year variable to check our estimates against NHS Digital HES estimates
+#--------------------------
+
+df_hes_primary <- df_hes_primary %>%
+	mutate(financial_year = case_when(
+                               start_date >= '2009-01-01' & start_date <= '2009-04-05' ~ "08/09",
+                               start_date >= '2009-04-06' & start_date <= '2010-04-05' ~ "09/10",
+                               start_date >= '2010-04-06' & start_date <= '2011-04-05' ~ "10/11",
+                               start_date >= '2011-04-06' & start_date <= '2012-04-05' ~ "11/12",
+                               start_date >= '2012-04-06' & start_date <= '2013-04-05' ~ "12/13",
+                               start_date >= '2013-04-06' & start_date <= '2014-04-05' ~ "13/14",  
+                               start_date >= '2014-04-06' & start_date <= '2015-04-05' ~ "14/15", 
+                               start_date >= '2015-04-06' & start_date <= '2016-04-05' ~ "15/16",
+                               start_date >= '2016-04-06' & start_date <= '2017-04-05' ~ "16/17",
+                               start_date >= '2017-04-06' & start_date <= '2018-04-05' ~ "17/18",
+                               start_date >= '2018-04-06' & start_date <= '2019-04-05' ~ "18/19",
+                               start_date >= '2019-04-06' & start_date <= '2020-04-05' ~ "19/20",
+                               start_date >= '2020-04-06' & start_date <= '2021-04-05' ~ "20/21",
+                               start_date >= '2021-04-06' & start_date <= '2022-04-05' ~ "21/22",
+                               start_date >= '2022-04-06' & start_date <= '2023-04-05' ~ "22/23",
+                               start_date >= '2023-04-06' & start_date <= '2023-12-31' ~ "23/24",
+                               TRUE ~ "No value"))
+
+# check
+if (run_checks == TRUE) {  
+   
+  # count of first endo diagnoses by month
+  df_first_endo_diag_by_month_all_episodes_primary <- df_hes_primary %>%
+    select(start_date, year_month, NEWNHSNO, diag_endo) %>%
+    filter(!is.na(start_date)) %>% 
+    filter(diag_endo == 1) %>%  
+    group_by(NEWNHSNO) %>%
+    filter(start_date == min(start_date)) %>%
+    ungroup() %>%
+    distinct() %>%
+    group_by(year_month) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    arrange(year_month) %>%
+    collect()
+
+  print(df_first_endo_diag_by_month_all_episodes_primary)
+
+  write.csv(df_first_endo_diag_by_month_all_episodes_primary, 
+            paste0(out_path, "num_first_endo_diag_by_month_supplementary.csv"),
+            row.names = FALSE)
+  
+  df_first_endo_diag_by_month_2011_2022_primary <- df_first_endo_diag_by_month_all_episodes_primary %>%
+    filter(year_month >= "2011-04" & year_month <= "2023-06")
+    
+  print(df_first_endo_diag_by_month_2011_2022_primary)
+
+  write.csv(df_first_endo_diag_by_month_2011_2022_primary, 
+            paste0(out_path, "num_first_endo_diag_by_month_2011_2023_supplementary.csv"),
+            row.names = FALSE)
+
+  # plot count of first endo diagnoses by month
+  ggplot(data = df_first_endo_diag_by_month_2011_2022_primary, 
+         aes(x = year_month, 
+             y = n,
+             group = 1)) +
+    geom_point(col = "#206095", size = 1) +
+    geom_line(col = "#206095") +
+    labs(title = "Count of first primary endometriosis diagnoses by month, Jan 2011 to Jun 2023",
+         x = "Month",
+         y = "") +
+    scale_y_continuous(limits = c(0, NA), labels = scales::comma) +
+    scale_x_discrete(breaks = c("2012-01", "2013-01", 
+                                "2014-01", "2015-01", "2016-01",
+                                "2017-01", "2018-01", "2019-01",
+                                "2020-01", "2021-01", "2022-01",
+                                "2023-01")) +
+    theme_bw()
+
+  ggsave(paste0(out_path_plots, "plot_num_first_endo_diag_by_month_2011_2023_supplementary.pdf"),
+         width = 10, height = 4, units = "in")
+
+  
+}
+
+#--------------------------
+# filter episodes to those starting and ending during the study period
+#--------------------------
+
+df_hes_study_period_primary <- filter(df_hes_primary, 
+                              !is.na(start_date) & 
+                              !is.na(end_date) &
+                              start_date >= study_start_date & 
+                              start_date <= study_end_date &
+                              end_date <= study_end_date &
+                              # remove system defaults for missing and invalid end dates
+                              end_date > "1801-01-01")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  hes_episodes_during_study_period_primary <- df_hes_study_period_primary %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  hes_episodes_during_study_period_endo_primary <- df_hes_study_period_primary %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  sample_flow <- sample_flow %>%
+    mutate(endo_primary = ifelse(sample == "hes_episodes_during_study_period",
+                                 hes_episodes_during_study_period_endo_primary,
+                                 endo_primary))
+  
+  print(sample_flow)
+  
+}
+
+# check
+if (run_checks == TRUE) {  
+  df_hes_study_period_primary %>% summarise(min(start_date), max(start_date))
+  df_hes_study_period_primary %>% summarise(min(end_date), max(end_date))  
+}
+
+
+#--------------------------
+# for anyone with an endo diagnosis, filter to episodes with endo diagnoses only 
+# restrict to first date of event
+# group by NHS_no and then use first event
+# start_date is a pre-existing variable from HES that refers to record level timestamp
+#--------------------------
+
+df_hes_first_event_primary <- df_hes_endo_count3_primary %>% 
+  group_by(NEWNHSNO) %>%
+  filter(diag_endo == max(diag_endo)) %>%
+  ungroup() %>%
+  group_by(NEWNHSNO) %>%
+  filter(start_date == min(start_date)) %>%
+  ungroup()
+
+
+#--------------------------
+# de-duplicate those with multiple flags on same day
+# as this is episodic data there may be multiple entries per day
+#--------------------------
+
+# only keep distinct NHS numbers
+df_hes_dist_primary <- df_hes_first_event_primary %>% 
+  distinct(NEWNHSNO, .keep_all = T)
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  hes_distinct_nhs_numbers_primary <- df_hes_dist_primary %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  hes_distinct_nhs_numbers_endo_primary <- df_hes_dist_primary %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  sample_flow <- sample_flow %>%
+    mutate(endo_primary = ifelse(sample == "hes_distinct_nhs_numbers_during_study_period",
+                                 hes_distinct_nhs_numbers_endo_primary,
+                                 endo_primary))
+  
+  print(sample_flow)
+
+}
+
+
+#--------------------------
+# add primary suffix to variable names
+#--------------------------
+
+df_hes_dist_primary <- df_hes_dist_primary %>%
+  rename_at(vars(-NEWNHSNO), function(x) {paste0(x, "_primary")})
+
+
+####################################################################################################################################
+# LINK HES DATASETS
+####################################################################################################################################
+
+df_hes_dist_bind <- full_join(df_hes_dist, df_hes_dist_primary, by = "NEWNHSNO")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  hes_bind <- df_hes_dist_bind %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  hes_bind_endo <- df_hes_dist_bind %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  hes_bind_endo_primary <- df_hes_dist_bind %>% 
+    filter(diag_endo_primary == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()  
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "hes_bind", 
+                         n = hes_bind,
+                         endo = hes_bind_endo,
+                         endo_primary = hes_bind_endo_primary)
+  print(sample_flow)
+
+}
+
+# check
+# mean number of endo diagnoses during study period:
+if (run_checks == TRUE) {  
+  df_hes_dist_bind %>% group_by(diag_endo, diag_endo_primary) %>% tally() %>% collect() %>% print()
+}
+
+
+####################################################################################################################################
+# CENSUS 2011
+####################################################################################################################################
+
+df_cen <- sdf_sql(sc, paste0("SELECT sex_census, age_census, dob_census, dob_month_census, dob_day_census, final_nhs_number, aethpuk11_census,
+ethpuk11_census, cob_census, aggcobpuk113_census, country_name_census, mainlang_census, aggmainlangprf11_census, hlqpuk11_census, relpuk11_census,
+region_code_census, region_name_census, la_code_census, la_name_census, ruralurban_code_census, ruralurban_name_census,
+nssec_census, nsshuk11_census, disability_census, health_census, present_in_cenmortlink, cen_pr_flag, present_in_census,
+uresindpuk11_census, il4_person_id_census, census_person_id, lsoa_code_census, dod_deaths, dor_deaths FROM ", census_dataset))
+
+# remove those not enumerated in the census
+df_cen <- filter(df_cen, present_in_census == 1)
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  census_all <- df_cen %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "census_all", 
+                         n = census_all,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+
+}
+
+df_cen2 <- df_cen %>%
+  # remove those who were not usual residents at the time of the census
+  filter(uresindpuk11_census == 1)
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  census_usual_residents <- df_cen2 %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "census_usual_residents", 
+                         n = census_usual_residents,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+df_cen2 <- df_cen2 %>%
+  # remove those not living in England
+  mutate(country = substr(region_code_census, 1, 1)) %>%
+  filter(country == "E")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  census_living_in_England <- df_cen2 %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "census_living_in_England", 
+                         n = census_living_in_England,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+df_cen2 <- df_cen2 %>%
+  # remove those not linked to an NHS number
+  filter((present_in_cenmortlink == 1) & (cen_pr_flag == 1))
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  census_linked_to_pr <- df_cen2 %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "census_linked_to_pr", 
+                         n = census_linked_to_pr,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+# remove anyone who died before or on the study start date
+df_cen3 <- df_cen2 %>% 
+  filter(is.na(dod_deaths) | dod_deaths > study_start_date)
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  census_alive <- df_cen3 %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "census_alive", 
+                         n = census_alive,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+
+#--------------------------
+# create labelled versions of variables to make results easier to interpret
+# create any derived analytical variables
+#--------------------------
+
+df_cen_rename <- df_cen3 %>%
+	     
+     mutate(age_group_5 = case_when(age_census < 10 ~ "<10",
+                                    age_census >= 10 & age_census < 15 ~ "10-14",
+                                    age_census >= 15 & age_census < 20 ~ "15-19",
+                                    age_census >= 20 & age_census < 25 ~ "20-24",
+                                    age_census >= 25 & age_census < 30 ~ "25-29",
+                                    age_census >= 30 & age_census < 35 ~ "30-34",
+                                    age_census >= 35 & age_census < 40 ~ "35-39",
+                                    age_census >= 40 & age_census < 45 ~ "40-44",
+                                    age_census >= 45 & age_census < 50 ~ "45-49",
+                                    age_census >= 50 & age_census < 55 ~ "50-54",
+                                    age_census >= 55 & age_census < 60 ~ "55-59",
+                                    age_census >= 60 & age_census < 65 ~ "60-64",
+                                    age_census >= 65 & age_census < 70 ~ "65-69",
+                                    age_census >= 70 & age_census < 75 ~ "70-74",
+                                    age_census >= 75 & age_census < 80 ~ "75-79",
+                                    age_census >= 80 ~ "80 plus",
+                                    TRUE ~ "Not classified"),
+             
+          ethnicity_detailed = case_when(ethpuk11_census == 1 ~ 'White: English/Welsh/Scottish/Northern Irish/British',
+                                    ethpuk11_census == 2 ~ 'White: Irish',
+                                    ethpuk11_census == 3 ~ 'White: Gypsy or Irish Traveller',
+                                    ethpuk11_census == 4 ~ 'White: Other White',
+                                    ethpuk11_census == 5 ~ 'Mixed/multiple ethnic groups: White and Black Caribbean',
+                                    ethpuk11_census == 6 ~ 'Mixed/multiple ethnic groups: White and Black African',
+                                    ethpuk11_census == 7 ~ 'Mixed/multiple ethnic groups: White and Asian',
+                                    ethpuk11_census == 8 ~ 'Mixed/multiple ethnic groups: Other Mixed',
+                                    ethpuk11_census == 9 ~ 'Asian/Asian British: Indian',
+                                    ethpuk11_census == 10 ~ 'Asian/Asian British: Pakistani',
+                                    ethpuk11_census == 11 ~ 'Asian/Asian British: Bangladeshi',
+                                    ethpuk11_census == 12 ~ 'Asian/Asian British: Chinese',
+                                    ethpuk11_census == 13 ~ 'Asian/Asian British: Other Asian',
+                                    ethpuk11_census == 14 ~ 'Black/African/Caribbean/Black British: African',
+                                    ethpuk11_census == 15 ~ 'Black/African/Caribbean/Black British: Caribbean',
+                                    ethpuk11_census == 16 ~ 'Black/African/Caribbean/Black British: Other Black',
+                                    ethpuk11_census == 17 ~ 'Other ethnic group: Arab',
+                                    ethpuk11_census == 18 ~ 'Other ethnic group: Any other ethnic group',
+                                    TRUE ~ "Not classified"),
+                                    
+          ethnicity_agg = case_when(ethpuk11_census == 1 | ethpuk11_census == 2 | ethpuk11_census == 3 | ethpuk11_census == 4 ~ "White",
+                                    ethpuk11_census == 5 | ethpuk11_census == 6 | ethpuk11_census == 7 | ethpuk11_census == 8 ~ "Mixed/Multiple ethnic groups",
+                                    ethpuk11_census == 9 | ethpuk11_census == 10 | ethpuk11_census == 11 | ethpuk11_census == 12 | ethpuk11_census == 13 ~ "Asian/Asian British",
+                                    ethpuk11_census == 14 | ethpuk11_census == 15 | ethpuk11_census == 16 ~ "Black/African/Caribbean/Black British",
+                                    ethpuk11_census == 17 | ethpuk11_census == 18 ~ "Other ethnic group",
+                                    TRUE ~ "Not classified"),
+
+          cob = case_when(aggcobpuk113_census == 1 ~ "Born in the UK", 
+                          aggcobpuk113_census == 2 ~ "Born outside the UK",
+                          TRUE ~ "Not classified"),
+
+          main_language = case_when(aggmainlangprf11_census == 1 ~ "Main language is English", 
+                                    aggmainlangprf11_census == 2 | 
+                                    aggmainlangprf11_census == 3 ~ "Main language is not English",
+                                    TRUE ~ "Not classified"),                              
+                                                                                         
+          qualifications = case_when(hlqpuk11_census == 10 ~ "No academic or professional qualifications",
+                                     hlqpuk11_census == 11 ~ "Level 1",
+                                     hlqpuk11_census == 12 ~ "Level 2",
+                                     hlqpuk11_census == 13 ~ "Apprenticeship",
+                                     hlqpuk11_census == 14 ~ "Level 3",
+                                     hlqpuk11_census == 15 ~ "Level 4 and above",
+                                     hlqpuk11_census == 16 ~ "Other", 
+                                     TRUE ~ "Not classified"),
+
+          region = case_when(region_code_census == "E12000001" ~ "North East", 
+                              region_code_census == "E12000002" ~ "North West", 
+                              region_code_census == "E12000003" ~ "Yorkshire and the Humber", 
+                              region_code_census == "E12000004" ~ "East Midlands", 
+                              region_code_census == "E12000005" ~ "West Midlands", 
+                              region_code_census == "E12000006" ~ "East of England", 
+                              region_code_census == "E12000007" ~ "London", 
+                              region_code_census == "E12000008" ~ "South East", 
+                              region_code_census == "E12000009" ~ "South West",
+                              region_code_census == "W92000004" ~ "Wales",
+                              TRUE ~ "Not classified"),
+
+          nssec_hh = case_when(nsshuk11_census >= 1 & nsshuk11_census < 4 ~ "Class 1",
+                                nsshuk11_census >= 4 & nsshuk11_census < 7 ~ "Class 2",
+                                nsshuk11_census >= 7 & nsshuk11_census < 8 ~ "Class 3",                          
+                                nsshuk11_census >= 8 & nsshuk11_census < 10 ~ "Class 4",                          
+                                nsshuk11_census >= 10 & nsshuk11_census < 12 ~ "Class 5",                          
+                                nsshuk11_census >= 12 & nsshuk11_census < 13 ~ "Class 6",                                                       
+                                nsshuk11_census >= 13 & nsshuk11_census < 14 ~ "Class 7",
+                                nsshuk11_census >= 14 & nsshuk11_census < 15 ~ "Class 8",
+                                nsshuk11_census == 15 ~ "Students", 
+                                TRUE ~ "Not classified"),
+
+          disability = case_when(disability_census == "1" ~ "Day to day activities limited a lot",
+                                 disability_census == "2" ~ "Day to day activities limited a little",
+                                 disability_census == "3" ~ "Day to day activities not limited",
+                                 TRUE ~ "Not classified"),
+
+          general_health = case_when(health_census == 1 ~ "Very good health",
+                  health_census == 2 ~ "Good health",
+                  health_census == 3 ~ "Fair health",
+                  health_census == 4 ~ "Bad health",
+                  health_census == 5 ~ "Very bad health",
+                  TRUE ~ "Not classified"),
+
+          rural_urban = case_when(ruralurban_code_census %in% c("A1", "A2", "C1", "C2") ~ "Urban",
+                                  ruralurban_code_census %in% c("D1", "D2", "E1", "E2", "F1", "F2") ~ "Rural",
+                                  TRUE ~ "Not classified"))
+
+
+#--------------------------
+# link to IMD data
+#--------------------------
+
+df_cen_rename_with_imd <- left_join(df_cen_rename, df_imd, by = c("lsoa_code_census" = "lsoa11cd"))
+
+df_cen_rename_with_imd <- mutate(df_cen_rename_with_imd, imd_decile = as.character(imd_decile))
+
+#--------------------------
+# link to utla names
+#--------------------------
+
+df_cen_rename_with_utla <- left_join(df_cen_rename_with_imd, df_utla_lookup, by = c("lsoa_code_census" = "lsoa11"))
+
+
+###################################################################################################
+# MERGE CENSUS 2011 AND HES - CENSUS 2011 AS THE POPULATION SPINE
+###################################################################################################
+
+#--------------------------
+# left join HES onto census 2011 
+# merge using final_nhs_number from census and NEWNHSNO from HES
+#--------------------------
+
+df_cen_hes_join <- left_join(df_cen_rename_with_utla, df_hes_dist_bind, by = c("final_nhs_number" = "NEWNHSNO"))
+
+#--------------------------
+#join the counts of pre-study HES episodes back onto the linked dataset
+#--------------------------
+
+df_cen_hes_join2 <- left_join(df_cen_hes_join, df_hes_pre_study3, by = c("final_nhs_number" = "NEWNHSNO"))
+
+#--------------------------
+#join the flags for pre-study diagnosis of endometriosis onto the linked dataset
+#--------------------------
+
+df_cen_hes_join3 <- left_join(df_cen_hes_join2, df_hes_diag_endo_pre_study3, by = c("final_nhs_number" = "NEWNHSNO"))
+
+#--------------------------
+# replace all missing flags with 0 (people in census but not in HES)
+#--------------------------
+
+df_cen11_hes_join4 <- df_cen_hes_join3 %>%
+  mutate(diag_endo = ifelse(is.na(diag_endo), 0, diag_endo)) %>%
+  mutate(diag_endo_primary = ifelse(is.na(diag_endo_primary), 0, diag_endo_primary)) %>%
+  mutate(diag_endo_count = ifelse(is.na(diag_endo_count), 0, diag_endo_count)) %>%
+  mutate(diag_endo_count_primary = ifelse(is.na(diag_endo_count_primary), 0, diag_endo_count_primary)) %>%
+  mutate(in_hes = ifelse(is.na(in_hes), 0, in_hes)) %>%
+  mutate(in_hes_primary = ifelse(is.na(in_hes_primary), 0, in_hes_primary)) %>%
+  mutate(num_epi_pre_study = ifelse(is.na(num_epi_pre_study), 0, num_epi_pre_study)) %>%
+  mutate(diag_endo_pre_study = ifelse(is.na(diag_endo_pre_study), 0, diag_endo_pre_study))
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  census_hes_linked <- df_cen11_hes_join4 %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  census_hes_linked_endo <- df_cen11_hes_join4 %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  census_hes_linked_endo_primary <- df_cen11_hes_join4 %>% 
+    filter(diag_endo_primary == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()  
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "census_hes_linked", 
+                         n = census_hes_linked,
+                         endo = census_hes_linked_endo,
+                         endo_primary = census_hes_linked_endo_primary)
+  print(sample_flow)
+  
+}
+
+
+#--------------------------
+# restrict to female only
+# but we have to use census variable here, not the HES variable, as the census is the population spine
+# df_cen11_hes_fin
+#--------------------------
+
+df_cen11_hes_sex <- filter(df_cen11_hes_join4, sex_census == 2)
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  census_hes_female_only <- df_cen11_hes_sex %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  census_hes_female_only_endo <- df_cen11_hes_sex %>% 
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  census_hes_female_only_endo_primary <- df_cen11_hes_sex %>% 
+    filter(diag_endo_primary == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()  
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "census_hes_female_only", 
+                         n = census_hes_female_only,
+                         endo = census_hes_female_only_endo,
+                         endo_primary = census_hes_female_only_endo_primary)
+  print(sample_flow)
+  
+}
+
+
+#--------------------------
+# restrict to age 10 and over at the time of census 2011
+#--------------------------
+
+df_cen11_hes_age_filtered <- df_cen11_hes_sex
+
+if (run_checks == TRUE) {  
+
+  df_cen11_hes_age_filtered %>%
+    filter(diag_endo == 1) %>%
+    group_by(age_census) %>%
+    tally() %>%
+    collect() %>%
+    arrange(age_census) %>%
+    print()
+
+  df_cen11_hes_age_filtered %>%
+    filter(diag_endo == 1) %>%
+    group_by(ADMIAGE) %>%
+    tally() %>%
+    collect() %>%
+    arrange(ADMIAGE) %>%
+    print()
+
+  df_cen11_hes_age_filtered %>%
+    filter(diag_endo == 1) %>%
+    group_by(age_census, ADMIAGE) %>%
+    tally() %>%
+    collect() %>%
+    arrange(age_census, ADMIAGE) %>%
+    print()
+
+}
+
+
+#--------------------------
+# format HES geographical variables
+#--------------------------
+
+df_cen11_hes_age_filtered <- mutate(df_cen11_hes_age_filtered, 
+                           region_hes = case_when(RESGOR_ONS == "E12000001" ~ "North East",
+                                                  RESGOR_ONS == "E12000002" ~ "North West",
+                                                  RESGOR_ONS == "E12000003" ~ "Yorkshire and the Humber",
+                                                  RESGOR_ONS == "E12000004" ~ "East Midlands",
+                                                  RESGOR_ONS == "E12000005" ~ "West Midlands",
+                                                  RESGOR_ONS == "E12000006" ~ "East of England",
+                                                  RESGOR_ONS == "E12000007" ~ "London",
+                                                  RESGOR_ONS == "E12000008" ~ "South East",
+                                                  RESGOR_ONS == "E12000009" ~ "South West",
+                                                  TRUE ~ "Outside England or unknown"))
+
+#--------------------------
+# link HES local authority district codes to names
+#--------------------------
+
+# look up 2021 local authority district names and codes
+# RESLADST contains codes across 2011-2021 geographies so we look up the 2021 code and name for consistent labelling
+df_cen11_hes_age_filtered_geog <- left_join(df_cen11_hes_age_filtered, df_utla_names_sdf, by = c("RESLADST" = "ladcd")) %>% 
+  mutate(ladst_hes = case_when(
+    grepl("E0", RESLADST) ~ ladst_hes,
+    TRUE ~ "Outside England or unknown")) %>%
+  mutate(utla_hes = case_when(
+    grepl("E0", RESLADST) ~ utla_hes,
+    TRUE ~ "Outside England or unknown"))
+
+if (run_checks == TRUE) {  
+  
+  df_cen11_hes_age_filtered_geog %>% group_by(RESLADST, ladst_hes, utla_hes) %>% tally() %>% collect() %>% arrange(RESLADST, ladst_hes, utla_hes) %>% print()
+
+}
+
+
+#--------------------------
+# create age at diagnosis variables
+#--------------------------
+
+# create a derived age at diagnosis variable using census DOB
+# 365.25 days to account for 1/4 of leap year day per year (once every 4 years)
+df_cen11_hes_age_at_diag <- df_cen11_hes_age_filtered_geog %>%
+  mutate(age_at_diag_derived = ifelse(!is.na(dob_census) & !is.na(start_date), datediff(start_date, dob_census)/365.25, NULL)) %>%
+  mutate(age_at_diag_derived = floor(age_at_diag_derived)) %>%
+  mutate(age_at_diag_derived_5 = case_when(age_at_diag_derived < 10 ~ "<10",
+                                           age_at_diag_derived >= 10 & age_at_diag_derived < 15 ~ "10-14",
+                                           age_at_diag_derived >= 15 & age_at_diag_derived < 20 ~ "15-19",
+                                           age_at_diag_derived >= 20 & age_at_diag_derived < 25 ~ "20-24",
+                                           age_at_diag_derived >= 25 & age_at_diag_derived < 30 ~ "25-29",
+                                           age_at_diag_derived >= 30 & age_at_diag_derived < 35 ~ "30-34",
+                                           age_at_diag_derived >= 35 & age_at_diag_derived < 40 ~ "35-39",
+                                           age_at_diag_derived >= 40 & age_at_diag_derived < 45 ~ "40-44",
+                                           age_at_diag_derived >= 45 & age_at_diag_derived < 50 ~ "45-49",
+                                           age_at_diag_derived >= 50 & age_at_diag_derived < 55 ~ "50-54",
+                                           age_at_diag_derived >= 55 & age_at_diag_derived < 60 ~ "55-59",
+                                           age_at_diag_derived >= 60 & age_at_diag_derived < 65 ~ "60-64",
+                                           age_at_diag_derived >= 65 & age_at_diag_derived < 70 ~ "65-69",
+                                           age_at_diag_derived >= 70 & age_at_diag_derived < 75 ~ "70-74",
+                                           age_at_diag_derived >= 75 & age_at_diag_derived < 80 ~ "75-79",
+                                           age_at_diag_derived >= 80 ~ "80 plus",
+                                           TRUE ~ "No value")) %>%
+  # set age at diagnosis to age_at_diag_derived if ADMIAGE is 0 or 999, otherwise use ADMIAGE
+  # set non-endo diagnoses to 0
+  # we are only interested in endo diagnoses
+  mutate(age_at_diag_final = case_when(diag_endo == 1 & ADMIAGE %in% c("0", "999") ~ age_at_diag_derived,
+                                       diag_endo == 1 & ADMIAGE != 0 & ADMIAGE != 999 ~ ADMIAGE,
+                                       TRUE ~ NULL)) %>%
+  mutate(age_at_diag_final_5 = case_when(age_at_diag_final < 10 ~ "<10",
+                                          age_at_diag_final >= 10 & age_at_diag_final < 15 ~ "10-14",
+                                          age_at_diag_final >= 15 & age_at_diag_final < 20 ~ "15-19",
+                                          age_at_diag_final >= 20 & age_at_diag_final < 25 ~ "20-24",
+                                          age_at_diag_final >= 25 & age_at_diag_final < 30 ~ "25-29",
+                                          age_at_diag_final >= 30 & age_at_diag_final < 35 ~ "30-34",
+                                          age_at_diag_final >= 35 & age_at_diag_final < 40 ~ "35-39",
+                                          age_at_diag_final >= 40 & age_at_diag_final < 45 ~ "40-44",
+                                          age_at_diag_final >= 45 & age_at_diag_final < 50 ~ "45-49",
+                                          age_at_diag_final >= 50 & age_at_diag_final < 55 ~ "50-54",
+                                          age_at_diag_final >= 55 & age_at_diag_final < 60 ~ "55-59",
+                                          age_at_diag_final >= 60 & age_at_diag_final < 65 ~ "60-64",
+                                          age_at_diag_final >= 65 & age_at_diag_final < 70 ~ "65-69",
+                                          age_at_diag_final >= 70 & age_at_diag_final < 75 ~ "70-74",
+                                          age_at_diag_final >= 75 & age_at_diag_final < 80 ~ "75-79",
+                                          age_at_diag_final >= 80 ~ "80 plus",
+                                          TRUE ~ "No value")) %>%
+  # set non-endo ADMIAGE to NULL in admiage_derived
+  # we are only interested in endo diagnoses
+  mutate(admiage_derived = case_when(diag_endo == 1 & ADMIAGE != 999 ~ ADMIAGE,
+                                     TRUE ~ NULL)) %>%
+  mutate(admiage_derived_5 = case_when(admiage_derived < 10 ~ "<10",
+                                        admiage_derived >= 10 & admiage_derived < 15 ~ "10-14",
+                                        admiage_derived >= 15 & admiage_derived < 20 ~ "15-19",
+                                        admiage_derived >= 20 & admiage_derived < 25 ~ "20-24",
+                                        admiage_derived >= 25 & admiage_derived < 30 ~ "25-29",
+                                        admiage_derived >= 30 & admiage_derived < 35 ~ "30-34",
+                                        admiage_derived >= 35 & admiage_derived < 40 ~ "35-39",
+                                        admiage_derived >= 40 & admiage_derived < 45 ~ "40-44",
+                                        admiage_derived >= 45 & admiage_derived < 50 ~ "45-49",
+                                        admiage_derived >= 50 & admiage_derived < 55 ~ "50-54",
+                                        admiage_derived >= 55 & admiage_derived < 60 ~ "55-59",
+                                        admiage_derived >= 60 & admiage_derived < 65 ~ "60-64",
+                                        admiage_derived >= 65 & admiage_derived < 70 ~ "65-69",
+                                        admiage_derived >= 70 & admiage_derived < 75 ~ "70-74",
+                                        admiage_derived >= 75 & admiage_derived < 80 ~ "75-79",
+                                        admiage_derived >= 80 ~ "80 plus",
+                                        TRUE ~ "No value"))
+
+# check
+if (run_checks == TRUE) {  
+
+  age_at_diag <- df_cen11_hes_age_at_diag %>% 
+    filter(diag_endo == 1) %>% 
+    select(age_at_diag_final) %>% 
+    arrange(age_at_diag_final) %>% 
+    pull()
+
+  summary_age_at_diag <- skimr::skim_without_charts(age_at_diag)
+  write.csv(summary_age_at_diag, paste0(out_path, "age_at_endo_diagnosis_summary.csv")) 
+  
+  age_census <- df_cen11_hes_age_at_diag %>% 
+    filter(diag_endo == 1) %>% 
+    select(age_census) %>% 
+    mutate(age_census = as.integer(age_census)) %>%  
+    arrange(age_census) %>% 
+    pull()
+  
+  summary_age_census <- skimr::skim_without_charts(age_census)
+  write.csv(summary_age_census, paste0(out_path, "age_census_endo_diagnosis_summary.csv"))
+
+  # check single year differences between ADMIAGE and age_at_diag_derived
+  diff_years_admiage_age_at_diag <- df_cen11_hes_age_at_diag %>%
+    filter(diag_endo == 1) %>%
+    mutate(diff_years_admiage_age_at_diag = ifelse(!(ADMIAGE %in% c("0", "999")), abs(age_at_diag_derived - ADMIAGE), "ADMIAGE missing or 0")) %>%
+    mutate(diff_years_admiage_age_at_diag = ifelse(diff_years_admiage_age_at_diag == "ADMIAGE missing or 0" | diff_years_admiage_age_at_diag <= 10, diff_years_admiage_age_at_diag, "11 and above")) %>%
+    group_by(diff_years_admiage_age_at_diag) %>%
+    tally() %>%
+    ungroup() %>%
+    collect() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    mutate(percentage = n / sum(n) * 100) %>%
+    arrange(diff_years_admiage_age_at_diag)
+  print(diff_years_admiage_age_at_diag)
+
+  # count derived age at diagnosis by age group
+  df_age_at_diag_derived <- df_cen11_hes_age_at_diag %>%
+    filter(diag_endo == 1) %>%
+    group_by(age_at_diag_derived_5) %>%
+    summarise(n_age_at_diag_derived = n()) %>%
+    ungroup() %>%
+    collect() %>%
+    mutate(n_age_at_diag_derived = round(n_age_at_diag_derived / 5) * 5) %>%
+    mutate(perc_age_at_diag_derived = round(n_age_at_diag_derived / sum(n_age_at_diag_derived) * 100, 2)) %>%
+    arrange(age_at_diag_derived_5) %>%
+    rename(age_group = age_at_diag_derived_5) %>%
+    collect()
+
+  # count HES ADMIAGE by age group
+  df_admiage_derived <- df_cen11_hes_age_at_diag %>%
+    filter(diag_endo == 1) %>%
+    group_by(admiage_derived_5) %>%
+    summarise(n_admiage_derived = n()) %>%
+    ungroup() %>%
+    collect() %>%
+    mutate(n_admiage_derived = round(n_admiage_derived / 5) * 5) %>%
+    mutate(perc_admiage_derived = round(n_admiage_derived / sum(n_admiage_derived) * 100, 2)) %>%
+    arrange(admiage_derived_5) %>%
+    rename(age_group = admiage_derived_5) %>%
+    collect()
+
+  # count final age at diagnosis by age group
+  df_age_at_diag_final <- df_cen11_hes_age_at_diag %>%
+    filter(diag_endo == 1) %>%
+    group_by(age_at_diag_final_5) %>%
+    summarise(n_age_at_diag_final = n()) %>%
+    ungroup() %>%
+    collect() %>%
+    mutate(n_age_at_diag_final = round(n_age_at_diag_final / 5) * 5) %>% 
+    mutate(perc_age_at_diag_final = round(n_age_at_diag_final / sum(n_age_at_diag_final) * 100, 2)) %>%
+    arrange(age_at_diag_final_5) %>%
+    rename(age_group = age_at_diag_final_5) %>%
+    collect()
+
+  # bind datasets ready for output
+  df_age_at_diag_bind <- full_join(df_age_at_diag_derived, df_admiage_derived, by = "age_group") %>%
+    arrange(age_group) %>%
+    group_by(age_group) %>%
+    mutate(n_match = max(n_admiage_derived, n_age_at_diag_derived) - abs(n_admiage_derived - n_age_at_diag_derived)) %>%
+    mutate(perc_match = round(100 * (n_match / max(n_admiage_derived, n_age_at_diag_derived)), 2)) %>%
+    ungroup()
+
+  # join on the final age_at_diagnosis used in the counts table
+  df_age_at_diag_bind2 <- full_join(df_age_at_diag_bind, df_age_at_diag_final, by = "age_group") %>%
+    arrange(age_group)
+  print(df_age_at_diag_bind2)
+
+
+  # Save output
+  List_of_dfs <- list(diff_years_admiage_age_at_diag, df_age_at_diag_bind2)
+
+  names(List_of_dfs) <- c(
+    "age_at_diag_diff_single_year",
+    "age_at_diag_comparison")
+
+  write_xlsx(List_of_dfs, paste0(out_path, "age_at_diagnosis.xlsx"))
+
+}
+
+
+#--------------------------
+# format method of admission to check emergency admissions
+#--------------------------
+
+df_cen11_hes_age_at_diag <- df_cen11_hes_age_at_diag %>%
+  mutate(emergency_admission_flag = case_when(
+    is.na(ADMIMETH) | ADMIMETH %in% c("NA", "98", "99") ~ "Not applicable or not known",
+    substr(ADMIMETH, 1, 1) == "2" ~ "Emergency admission",
+    TRUE ~ "Non-emergency admission"))
+
+
+#--------------------------
+# categorise num_epi_pre_study variable
+#--------------------------
+
+# compare number of HES episodes pre-study to census self-reported general health
+if (run_checks == TRUE) {  
+
+  # filter to <= 30 to better visualise in a plot
+  df_cen11_hes_num_epi_pre_study <- df_cen11_hes_age_at_diag %>% filter(num_epi_pre_study <= 30)
+
+  df_cen11_hes_num_epi_pre_study_comparison <- df_cen11_hes_num_epi_pre_study %>%
+    group_by(num_epi_pre_study, general_health) %>%
+    count() %>%
+    mutate(proportion = n/sum(n)) %>%
+    ungroup() %>%
+    collect()
+
+  ggplot(data = df_cen11_hes_num_epi_pre_study_comparison, 
+         aes(x = num_epi_pre_study, 
+             y = proportion, 
+             fill = fct_relevel(general_health, order_general_health))) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+    labs(title = "Number of HES episodes pre-study (0 to 30) by self-reported general health",
+         x = "Number of HES episodes pre-study",
+         y = "Proportion") +
+    theme_bw() +
+    theme(legend.position = "bottom") + 
+    guides(fill = guide_legend(nrow = 1, title = "Self-reported general health")) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 10))
+
+  ggsave(paste0(out_path_plots, "plot_num_epi_pre_study_by_health.pdf"), 
+          width = 10, height = 4, units = "in")
+  
+  ggplot(data = df_cen11_hes_num_epi_pre_study_comparison, 
+         aes(x = num_epi_pre_study, 
+             y = proportion, 
+             fill = fct_relevel(general_health, order_general_health))) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(title = "Number of HES episodes pre-study (0 to 30) by self-reported general health",
+         x = "Number of HES episodes pre-study",
+         y = "Proportion") +
+    theme_bw() +
+    theme(legend.position = "bottom") + 
+    guides(fill = guide_legend(nrow = 1, title = "Self-reported general health")) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 10))
+
+  ggsave(paste0(out_path_plots, "plot_num_epi_pre_study_by_health_stacked.pdf"), 
+          width = 10, height = 4, units = "in")
+  
+}
+
+
+# define groups
+df_cen11_hes_num_epi_pre_study_grouped <- df_cen11_hes_age_at_diag %>%
+  mutate(num_epi_pre_study_grouped = case_when(num_epi_pre_study == 0 ~ "0",
+                                               num_epi_pre_study >= 1 & num_epi_pre_study <= 3 ~ "1-3",
+                                               num_epi_pre_study >= 4 & num_epi_pre_study <= 6 ~ "4-6",
+                                               num_epi_pre_study >= 7 & num_epi_pre_study <= 9 ~ "7-9",
+                                               num_epi_pre_study >= 10 & num_epi_pre_study <= 14 ~ "10-14",
+                                               num_epi_pre_study >= 15 ~ "15+",
+                                               TRUE ~ "XXX"))
+
+if (run_checks == TRUE) {  
+
+  # compare groups with general health
+  df_cen11_hes_num_epi_pre_study_grouped_health <- df_cen11_hes_num_epi_pre_study_grouped %>%
+    group_by(num_epi_pre_study_grouped, general_health) %>%
+    count() %>%
+    mutate(proportion = n/sum(n)) %>%
+    ungroup() %>%
+    collect()
+
+  ggplot(data = df_cen11_hes_num_epi_pre_study_grouped_health, 
+         aes(x = fct_relevel(num_epi_pre_study_grouped, order_num_epi_pre_study_grouped), 
+             y = proportion, 
+             fill = fct_relevel(general_health, order_general_health))) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+    labs(title = "Number of HES episodes pre-study by self-reported general health",
+         x = "Number of HES episodes pre-study",
+         y = "Proportion") +
+    theme_bw() +
+    theme(legend.position = "bottom") + 
+    guides(fill = guide_legend(nrow = 1, title = "Self-reported general health"))
+
+  ggsave(paste0(out_path_plots, "plot_num_epi_pre_study_grouped_by_health.pdf"), 
+          width = 10, height = 4, units = "in")
+  
+  
+  # plot by age and population
+  df_cen11_hes_num_epi_pre_study_grouped_age <- df_cen11_hes_num_epi_pre_study_grouped %>%
+    mutate(population = ifelse(diag_endo == 1, "endo", "no_endo")) %>%
+    group_by(num_epi_pre_study_grouped, age_group_10, population) %>%
+    count() %>%
+    ungroup() %>%
+    group_by(age_group_10, population) %>%
+    mutate(proportion = n/sum(n)) %>%
+    ungroup() %>%
+    collect()
+  print(df_cen11_hes_num_epi_pre_study_grouped_age)
+
+  ggplot(data = df_cen11_hes_num_epi_pre_study_grouped_age, 
+         aes(x = fct_relevel(age_group_10, rev(order_age_group_10)), 
+             y = proportion, 
+             fill = fct_relevel(num_epi_pre_study_grouped, rev(order_num_epi_pre_study_grouped)))) +
+    geom_bar(stat = "identity", position = "stack") +
+    facet_wrap(~ population, nrow = 2) +
+    labs(title = "Number of HES episodes pre-study by age group and endometriosis diagnosis status",
+         x = "Age group",
+         y = "Proportion") +
+    theme_bw() +
+    theme(legend.position = "bottom") + 
+    guides(fill = guide_legend(nrow = 1, reverse = TRUE, title = "Number of HES episodes pre-study")) +
+    scale_fill_hue(direction = -1) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +
+    coord_flip()
+
+  ggsave(paste0(out_path_plots, "plot_num_epi_pre_study_grouped_by_age_endo_diag.pdf"), 
+          width = 10, height = 4, units = "in")
+
+}
+
+
+#--------------------------
+# add identifiers for the populations:
+# in cen11 and HES with primary or secondary endo diagnosis
+# in cen11 and HES with primary endo diagnosis and no pre-study endo diagnosis
+# in cen11 and HES without endo diagnosis
+# in cen11 without endo diagnosis
+#--------------------------
+
+df_cen11_hes_fin <- df_cen11_hes_num_epi_pre_study_grouped %>%
+  mutate(population_main_split = case_when(in_hes == 1 & diag_endo == 1 ~ "in_cen_hes_endo",
+                                     in_hes == 1 & diag_endo == 0 ~ "in_cen_hes_no_endo",
+                                     in_hes == 0 & diag_endo == 0 ~ "in_cen_only_no_endo",
+                                     TRUE ~ "Unknown")) %>%
+  mutate(population_supplementary_split = case_when(in_hes == 1 & diag_endo_primary == 1 & diag_endo_pre_study == 0 ~ "in_cen_hes_endo",
+                                          diag_endo_pre_study == 1 ~ "remove",
+                                          in_hes == 1 & diag_endo_primary == 0 & diag_endo == 1  ~ "remove",
+                                          in_hes == 1 & diag_endo_primary == 0 & diag_endo == 0 & diag_endo_pre_study == 0 ~ "in_cen_hes_no_endo",
+                                          in_hes == 0 & diag_endo == 0 & diag_endo_pre_study == 0 ~ "in_cen_only_no_endo",
+                                          TRUE ~ "Unknown")) %>%
+  mutate(population_main = ifelse(population_main_split == "in_cen_hes_endo", "endo", "no_endo")) %>%
+  mutate(population_supplementary = case_when(population_supplementary_split == "in_cen_hes_endo" ~ "endo", 
+                                          population_supplementary_split %in% c("in_cen_hes_no_endo", "in_cen_only_no_endo") ~ "no_endo",
+                                          TRUE ~ "remove"))
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  main <- df_cen11_hes_fin %>%
+    filter(population_main %in% c("endo", "no_endo")) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  endo_main <- df_cen11_hes_fin %>% 
+    filter(population_main %in% c("endo", "no_endo")) %>%
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  endo_primary_main <- df_cen11_hes_fin %>%
+    filter(population_main %in% c("endo", "no_endo")) %>%
+    filter(diag_endo_primary == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "main_analysis", 
+                         n = main,
+                         endo = endo_main,
+                         endo_primary = endo_primary_main)
+  print(sample_flow)
+    
+  supplementary <- df_cen11_hes_fin %>%
+    filter(population_supplementary %in% c("endo", "no_endo")) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  endo_supplementary <- df_cen11_hes_fin %>% 
+    filter(population_supplementary %in% c("endo", "no_endo")) %>%
+    filter(diag_endo == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  endo_primary_supplementary <- df_cen11_hes_fin %>%
+    filter(population_supplementary %in% c("endo", "no_endo")) %>%
+    filter(diag_endo_primary == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "supplementary_analysis", 
+                         n = supplementary,
+                         endo = endo_supplementary,
+                         endo_primary = endo_primary_supplementary)
+  print(sample_flow)
+  
+}
+
+#--------------------------
+# split dataset into subpopulations for checks
+#--------------------------
+
+# main
+
+# with endo diagnosis
+df_endo_fin_main <- df_cen11_hes_fin %>% 
+  filter(population_main == "endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  endo_main <- df_endo_fin_main %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  endo_primary_main <- df_endo_fin_main %>%
+    filter(diag_endo_primary == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()  
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "main_with_endo_diagnosis", 
+                         n = endo_main,
+                         endo = endo_main,
+                         endo_primary = endo_primary_main)
+  print(sample_flow)
+  
+}
+
+
+# no endo diagnosis
+df_no_endo_fin_main <- df_cen11_hes_fin %>% 
+  filter(population_main == "no_endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  no_endo_main <- df_no_endo_fin_main %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "main_no_endo_diagnosis", 
+                         n = no_endo_main,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+
+# in cen11 and HES without endo diagnosis
+df_cen_hes_no_endo_fin_main <- df_cen11_hes_fin %>% 
+  filter(population_main_split == "in_cen_hes_no_endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  in_both_census_hes_no_endo_main <- df_cen_hes_no_endo_fin_main %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "main_in_both_census_hes_no_endo", 
+                         n = in_both_census_hes_no_endo_main,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+
+# in cen11 without endo diagnosis
+df_cen_only_no_endo_fin_main <- df_cen11_hes_fin %>% 
+  filter(population_main_split == "in_cen_only_no_endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  in_cen_only_no_endo_main <- df_cen_only_no_endo_fin_main %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "main_in_cen_only_no_endo", 
+                         n = in_cen_only_no_endo_main,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+
+# supplementary
+
+# with endo diagnosis
+df_endo_fin_supplementary <- df_cen11_hes_fin %>% 
+  filter(population_supplementary == "endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  endo_supplementary <- df_endo_fin_supplementary %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+  
+  endo_primary_supplementary <- df_endo_fin_supplementary %>%
+    filter(diag_endo_primary == 1) %>%
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()  
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "supplementary_with_endo_diagnosis", 
+                         n = endo_supplementary,
+                         endo = NULL,
+                         endo_primary = endo_primary_supplementary)
+  print(sample_flow)
+  
+}
+
+
+# no endo diagnosis
+df_no_endo_fin_supplementary <- df_cen11_hes_fin %>% 
+  filter(population_supplementary == "no_endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  no_endo_supplementary <- df_no_endo_fin_supplementary %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "supplementary_no_endo_diagnosis", 
+                         n = no_endo_supplementary,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+
+# in cen11 and HES without endo diagnosis
+df_cen_hes_no_endo_fin_supplementary <- df_cen11_hes_fin %>% 
+  filter(population_supplementary_split == "in_cen_hes_no_endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  in_both_census_hes_no_endo_supplementary <- df_cen_hes_no_endo_fin_supplementary %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "supplementary_in_both_census_hes_no_endo", 
+                         n = in_both_census_hes_no_endo_supplementary,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+
+# in cen11 without endo diagnosis
+df_cen_only_no_endo_fin_supplementary <- df_cen11_hes_fin %>% 
+  filter(population_supplementary_split == "in_cen_only_no_endo")
+
+# update sample flow
+if (run_sample_flow == TRUE) {
+  
+  in_cen_only_no_endo_supplementary <- df_cen_only_no_endo_fin_supplementary %>% 
+    tally() %>%
+    mutate(n = round(n / 5) * 5) %>%
+    pull()
+
+  sample_flow <- add_row(sample_flow, 
+                         sample = "supplementary_in_cen_only_no_endo", 
+                         n = in_cen_only_no_endo_supplementary,
+                         endo = NULL,
+                         endo_primary = NULL)
+  print(sample_flow)
+  
+}
+
+
+#--------------------------
+# Save sample flow
+#--------------------------
+
+if (run_sample_flow == TRUE) {  
+  write.csv(sample_flow, paste0(out_path, "sample_flow.csv"), row.names = FALSE)
+}
+
+#--------------------------
+# Checks
+#--------------------------
+
+if (run_checks == TRUE) {
+
+  # check missing
+  check_missing <- check_missing(df_cen11_hes_fin)
+
+  # total
+  total <- df_cen11_hes_fin %>% tally() %>% collect()
+
+  # diag_endo
+  diag_endo <- df_cen11_hes_fin %>% group_by(diag_endo, diag_endo_primary) %>% tally() %>% collect()
+  
+  # date of diagnosis
+  date_of_diagnosis <- df_cen11_hes_fin %>% group_by(start_date) %>% tally() %>% arrange(start_date) %>% collect()
+  date_of_diagnosis_primary <- df_cen11_hes_fin %>% group_by(start_date_primary) %>% tally() %>% arrange(desc(start_date_primary)) %>% collect()
+
+  # census starting population
+  census_pop <- df_cen11_hes_fin %>% 
+    group_by(present_in_census, present_in_cenmortlink, cen_pr_flag, country, uresindpuk11_census) %>%
+    tally() %>%
+    collect()
+
+  # deaths
+  dod <- df_cen11_hes_fin %>% 
+    group_by(dod_deaths) %>%
+    tally() %>%
+    arrange(dod_deaths) %>%
+    collect()
+
+  # num_epi_pre_study
+  num_epi_pre_study <- df_cen11_hes_fin %>%
+    group_by(num_epi_pre_study) %>%
+    tally() %>%
+    arrange(num_epi_pre_study) %>%
+    collect()
+
+  # diag_endo_pre_study
+  diag_endo_pre_study <- df_cen11_hes_fin %>%
+    group_by(diag_endo_pre_study) %>%
+    tally() %>%
+    collect()
+
+  # sex
+  sex <- df_cen11_hes_fin %>% 
+    group_by(sex_census, SEX) %>%
+    tally() %>%
+    arrange(SEX) %>%
+    collect()
+
+  # age
+  age <- df_cen11_hes_fin %>%
+    group_by(age_census, ADMIAGE, age_at_diag_final) %>%
+    tally() %>%
+    arrange(age_census, ADMIAGE, age_at_diag_final) %>%
+    collect()
+  
+  # subpopulations 
+  main_supplementary <- df_cen11_hes_fin %>% 
+    group_by(in_hes, diag_endo_primary, diag_endo, diag_endo_pre_study,
+             population_main, population_main_split, 
+             population_supplementary, population_supplementary_split) %>% 
+    tally() %>% 
+    collect()
+
+  main <- df_cen11_hes_fin %>% 
+    group_by(in_hes, diag_endo_primary, diag_endo, diag_endo_pre_study, population_main, population_main_split) %>%
+    tally() %>%
+    collect()
+  
+  supplementary <- df_cen11_hes_fin %>% 
+    group_by(in_hes, diag_endo_primary, diag_endo, diag_endo_pre_study, population_supplementary, population_supplementary_split) %>%
+    tally() %>%
+    collect()
+    
+  # Save dataset checks
+  dataset_checks <- list(check_missing, total, diag_endo, 
+                         date_of_diagnosis, date_of_diagnosis_primary, census_pop,
+                         dod, num_epi_pre_study, diag_endo_pre_study, sex, age, 
+                         main_supplementary, main, supplementary)
+
+  names(dataset_checks) <- c("check_missing", "total", "diag_endo", 
+                             "date_of_diagnosis", "date_of_diagnosis_primary", "census_pop",
+                             "dod", "num_epi_pre_study", "diag_endo_pre_study", "sex", "age", 
+                             "main_supplementary", "main", "supplementary")
+
+  writexl::write_xlsx(dataset_checks, paste0(out_path, "/dataset_checks.xlsx"))
+  
+}
+
+
+#--------------------------
+# Remove unneeded columns
+#--------------------------
+
+df_cen11_hes_fin <- df_cen11_hes_fin %>%
+  select(!c(dob_census, year, year_month, dob_month_census, dob_day_census, 
+            ethpuk11_census, ruralurban_code_census, ruralurban_name_census, mainlang_census,                                       
+            cob_census, aggcobpuk113_census, country_name_census, dod_deaths,
+            dor_deaths, cen_pr_flag, present_in_census, uresindpuk11_census,
+            present_in_cenmortlink, Endometriosis_flag, Endometriosis_uterus_flag, 
+            Endometriosis_ovary_flag, Endometriosis_fallopiantube_flag, Endometriosis_pelvicperitoneum_flag,
+            Endometriosis_rectovaginalseptumandvagina_flag, Endometriosis_intestine_flag,
+            Endometriosis_cutaneousscar_flag, Other_endometriosis_flag, Endometriosis_unspecified_flag,
+            Endometriosis_flag_primary, Endometriosis_uterus_flag_primary, 
+            Endometriosis_ovary_flag_primary, Endometriosis_fallopiantube_flag_primary, Endometriosis_pelvicperitoneum_flag_primary,
+            Endometriosis_rectovaginalseptumandvagina_flag_primary, Endometriosis_intestine_flag_primary,
+            Endometriosis_cutaneousscar_flag_primary, Other_endometriosis_flag_primary, Endometriosis_unspecified_flag_primary,
+            imd_rank, imd_quintile))
+
+colnames(df_cen11_hes_fin)
+
+
+#--------------------------
+# Save dataset
+#--------------------------
+
+if (save_dataset == TRUE) {  
+  
+  sparklyr::spark_write_table(
+    df_cen11_hes_fin, 
+    name = "..."), 
+    mode = "overwrite"
+  )
+
+}
+
+
+#-------------#
+# END OF FILE #
+#-------------#
